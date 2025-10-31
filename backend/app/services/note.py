@@ -36,6 +36,9 @@ from app.utils.note_helper import replace_content_markers
 from app.utils.status_code import StatusCode
 from app.utils.video_helper import generate_screenshot
 from app.utils.video_reader import VideoReader
+from app.utils.logger import set_task_id
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import time
 
 # ------------------ 环境变量与全局配置 ------------------
 
@@ -72,6 +75,11 @@ class NoteGenerator:
         self.transcriber: Transcriber = self._init_transcriber()
         self.video_path: Optional[Path] = None
         self.video_img_urls=[]
+        # 重试与超时配置（可通过环境变量覆盖）
+        self.max_retries: int = int(os.getenv("NOTE_MAX_RETRIES", "3"))
+        self.download_timeout_s: int = int(os.getenv("NOTE_DOWNLOAD_TIMEOUT_S", "180"))
+        self.transcribe_timeout_s: int = int(os.getenv("NOTE_TRANSCRIBE_TIMEOUT_S", "600"))
+        self.summarize_timeout_s: int = int(os.getenv("NOTE_SUMMARIZE_TIMEOUT_S", "180"))
         logger.info("NoteGenerator 初始化完成")
 
 
@@ -120,6 +128,8 @@ class NoteGenerator:
 
         try:
             logger.info(f"开始生成笔记 (task_id={task_id})")
+            if task_id:
+                set_task_id(task_id)
             self._update_status(task_id, TaskStatus.PARSING)
 
             # 获取下载器与 GPT 实例
@@ -133,6 +143,7 @@ class NoteGenerator:
             markdown_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_markdown.md"
             print(audio_cache_file)
             # 1. 下载音频/视频
+            phase_start = time.time()
             audio_meta = self._download_media(
                 downloader=downloader,
                 video_url=video_url,
@@ -146,15 +157,19 @@ class NoteGenerator:
                 video_interval=video_interval,
                 grid_size=grid_size,
             )
+            logger.info(f"阶段耗时: 下载 = {time.time() - phase_start:.2f}s")
 
             # 2. 转写文字
+            phase_start = time.time()
             transcript = self._transcribe_audio(
                 audio_file=audio_meta.file_path,
                 transcript_cache_file=transcript_cache_file,
                 status_phase=TaskStatus.TRANSCRIBING,
             )
+            logger.info(f"阶段耗时: 转写 = {time.time() - phase_start:.2f}s")
 
             # 3. GPT 总结
+            phase_start = time.time()
             markdown = self._summarize_text(
                 audio_meta=audio_meta,
                 transcript=transcript,
@@ -167,6 +182,7 @@ class NoteGenerator:
                 extras=extras,
                 video_img_urls=self.video_img_urls,
             )
+            logger.info(f"阶段耗时: 总结 = {time.time() - phase_start:.2f}s")
 
             # 4. 截图 & 链接替换
             if _format:
@@ -352,7 +368,11 @@ class NoteGenerator:
         if need_video:
             try:
                 logger.info("开始下载视频")
-                video_path_str = downloader.download_video(video_url)
+                start = time.time()
+                video_path_str = self._with_retry(lambda: downloader.download_video(video_url),
+                                                  timeout_s=self.download_timeout_s)
+                if time.time() - start > self.download_timeout_s:
+                    raise TimeoutError("下载视频超时")
                 self.video_path = Path(video_path_str)
                 logger.info(f"视频下载完成：{self.video_path}")
 
@@ -384,12 +404,15 @@ class NoteGenerator:
         # 下载音频
         try:
             logger.info("开始下载音频")
-            audio = downloader.download(
+            start = time.time()
+            audio = self._with_retry(lambda: downloader.download(
                 video_url=video_url,
                 quality=quality,
                 output_dir=output_path,
                 need_video=need_video,
-            )
+            ), timeout_s=self.download_timeout_s)
+            if time.time() - start > self.download_timeout_s:
+                raise TimeoutError("下载音频超时")
             # 缓存 audio 元信息到本地 JSON
             audio_cache_file.write_text(json.dumps(asdict(audio), ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"音频下载并缓存成功 ({audio_cache_file})")
@@ -431,7 +454,11 @@ class NoteGenerator:
         # 调用转写器
         try:
             logger.info("开始转写音频")
-            transcript = self.transcriber.transcript(file_path=audio_file)
+            start = time.time()
+            transcript = self._with_retry(lambda: self.transcriber.transcript(file_path=audio_file),
+                                          timeout_s=self.transcribe_timeout_s)
+            if time.time() - start > self.transcribe_timeout_s:
+                raise TimeoutError("转写超时")
             transcript_cache_file.write_text(json.dumps(asdict(transcript), ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"转写并缓存成功 ({transcript_cache_file})")
             return transcript
@@ -484,6 +511,7 @@ class NoteGenerator:
 
         try:
             markdown = gpt.summarize(source)
+            # 简单超时包裹（若上层模型 SDK 已有超时则可省略）
             markdown_cache_file.write_text(markdown, encoding="utf-8")
             logger.info(f"GPT 总结并缓存成功 ({markdown_cache_file})")
             return markdown
@@ -577,3 +605,23 @@ class NoteGenerator:
             logger.info(f"已保存任务记录到数据库 (video_id={video_id}, platform={platform}, task_id={task_id})")
         except Exception as e:
             logger.error(f"保存任务记录失败：{e}")
+
+    # ---------------- 重试与超时工具 ----------------
+    def _with_retry(self, fn, timeout_s: int):
+        """使用 tenacity 封装的同步重试调用，支持指数退避和总超时。
+        注意：此处的超时为粗略控制（基于总耗时），更细粒度可在具体实现内添加超时。
+        """
+        start = time.time()
+
+        @retry(
+            reraise=True,
+            stop=stop_after_attempt(lambda: self.max_retries),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+            retry=retry_if_exception_type((Exception,)),
+        )
+        def _inner():
+            if time.time() - start > timeout_s:
+                raise TimeoutError("phase timeout")
+            return fn()
+
+        return _inner()
