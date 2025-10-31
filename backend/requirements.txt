@@ -125,3 +125,5 @@ websockets==15.0.1
 yarl==1.19.0
 yt-dlp==2025.3.31
 zopfli==0.2.3.post1
+pytest==8.3.4
+pytest-asyncio==0.25.3
